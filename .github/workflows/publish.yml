@@ -1,0 +1,36 @@
+on:
+  push:
+    tags:
+      - v[0-9]+.*
+
+name: Publish
+
+permissions:
+  id-token: write
+
+jobs:
+  crates_publish:
+    name: Publish (crates.io)
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo install cargo-v
+
+      - name: cargo update version
+        run: cargo v $(git describe --tags | grep -oP '^v?\K[0-9]+\.[0-9]+\.[0-9]+') -y
+
+      - name: cargo login
+        run: cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: "cargo release publish"
+        run: |-
+          cargo publish \
+            --allow-dirty \
+            --no-verify \
