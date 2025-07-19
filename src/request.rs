@@ -6,7 +6,6 @@ use governor::{
     state::{InMemoryState, NotKeyed},
 };
 use http::Method;
-use log::info;
 use reqwest::{Client, IntoUrl, Request, Response};
 use reqwest_middleware::{ClientWithMiddleware, Middleware, Next, RequestBuilder};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
@@ -21,7 +20,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-use crate::Result;
+use crate::{Error, Result};
 
 const RETRY_LIMIT: u32 = 3;
 
@@ -47,7 +46,9 @@ impl ArchiveClient {
         let request = self.0.request(method, url);
         let response = request.send().await?;
         let response = response.bytes().await?;
-        serde_json::from_slice(&response).map_err(Into::into)
+        serde_json::from_slice(&response).map_err(|e| {
+            Error::UnexpectedResponse(e, String::from_utf8(response.to_vec()).unwrap())
+        })
     }
 
     pub async fn fetch<T: DeserializeOwned>(&self, url: impl IntoUrl) -> Result<T> {

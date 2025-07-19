@@ -6,6 +6,8 @@ pub enum Error {
     InvalidSession,
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
+    #[error("Unexpected response: {0}")]
+    UnexpectedResponse(serde_json::Error, String),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
