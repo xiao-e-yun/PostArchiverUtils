@@ -15,7 +15,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "native-tls-alpn"] }
 reqwest-retry = "0.7"
 reqwest-middleware = { version = "0.4", features = ["json"] }
 futures = "0.3"
-tokio = "1.46.1"
+tokio = { version = "1.46.1", features = ["macros"] }
 thiserror = "2.0.12"
 async-trait = "0.1.88"
 http = "1.3.1"
