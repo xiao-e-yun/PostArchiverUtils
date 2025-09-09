@@ -16,4 +16,6 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
 }

@@ -1084,6 +1084,7 @@ dependencies = [
  "reqwest",
  "reqwest-middleware",
  "reqwest-retry",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
