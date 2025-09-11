@@ -6,6 +6,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
 };
 use http::Method;
+use log::trace;
 use reqwest::{Client, IntoUrl, Request, Response};
 use reqwest_middleware::{ClientWithMiddleware, Middleware, Next, RequestBuilder};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
@@ -15,27 +16,78 @@ use std::{
     io::{BufWriter, Write},
     num::NonZeroU32,
     ops::{Deref, DerefMut},
-    sync::Arc,
     time::Duration,
 };
 use tokio::sync::Semaphore;
 
 use crate::{Error, Result};
 
-const RETRY_LIMIT: u32 = 3;
+pub struct ArchiveClientBuilder {
+    client: Client,
+    pre_min_limit: u32,
+    pre_sec_limit: Option<u32>,
+    max_conn_limit: Option<u32>,
+    retry_limit: u32,
+}
 
-#[derive(Debug, Clone)]
-pub struct ArchiveClient(ClientWithMiddleware);
+impl ArchiveClientBuilder {
+    pub fn new(client: Client, pre_min_limit: u32) -> Self {
+        Self {
+            client,
+            pre_min_limit,
+            pre_sec_limit: None,
+            max_conn_limit: None,
+            retry_limit: 3,
+        }
+    }
 
-impl ArchiveClient {
-    pub fn new(client: Client, limit: usize) -> Self {
-        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(RETRY_LIMIT);
-        let client = reqwest_middleware::ClientBuilder::new(client)
-            .with(SemaphoreMiddleware::new(limit))
+    pub fn pre_min_limit(mut self, limit: u32) -> Self {
+        self.pre_min_limit = limit;
+        self
+    }
+
+    pub fn pre_sec_limit(mut self, limit: u32) -> Self {
+        self.pre_sec_limit = Some(limit);
+        self
+    }
+
+    pub fn max_conn_limit(mut self, limit: u32) -> Self {
+        self.max_conn_limit = Some(limit);
+        self
+    }
+
+    pub fn retry_limit(mut self, limit: u32) -> Self {
+        self.retry_limit = limit;
+        self
+    }
+
+    pub fn build(self) -> ArchiveClient {
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(self.retry_limit);
+        let client = reqwest_middleware::ClientBuilder::new(self.client)
+            .with(SemaphoreMiddleware::new(
+                self.pre_min_limit,
+                self.pre_sec_limit.or(self.max_conn_limit).unwrap_or(4),
+                self.max_conn_limit.or(self.pre_sec_limit).unwrap_or(4),
+            ))
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
-        Self(client)
+        ArchiveClient {
+            inner: client,
+            retry: self.retry_limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveClient{
+    inner: ClientWithMiddleware,
+    retry: u32
+}
+
+impl ArchiveClient {
+    pub fn builder(client: Client, pre_min_limit:u32) -> ArchiveClientBuilder {
+        ArchiveClientBuilder::new(client, pre_min_limit)
     }
 
     pub async fn fetch_with_method<T: DeserializeOwned>(
@@ -43,7 +95,7 @@ impl ArchiveClient {
         method: Method,
         url: impl IntoUrl,
     ) -> Result<T> {
-        let request = self.0.request(method, url);
+        let request = self.inner.request(method, url);
         let response = request.send().await?;
         let response = response.bytes().await?;
         serde_json::from_slice(&response).map_err(|e| {
@@ -77,8 +129,8 @@ impl ArchiveClient {
         }
 
         let mut err = Ok(());
-        for _ in 0..=RETRY_LIMIT {
-            let request = self.0.request(method.clone(), url.clone());
+        for _ in 0..=self.retry {
+            let request = self.request(method.clone(), url.clone());
             match handle(request, file).await {
                 Ok(_) => return Ok(()),
                 Err(e) => err = Err(e),
@@ -96,27 +148,39 @@ impl Deref for ArchiveClient {
     type Target = ClientWithMiddleware;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for ArchiveClient {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 type ArchiveRateLimiter =
     RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware<QuantaInstant>>;
-#[derive(Debug, Clone)]
-pub struct SemaphoreMiddleware(Arc<(Semaphore, ArchiveRateLimiter)>);
+#[derive(Debug)]
+pub struct SemaphoreMiddleware {
+    max_conn_semaphore: Semaphore,
+    pre_sec_limiter: ArchiveRateLimiter,
+    pre_min_limiter: ArchiveRateLimiter,
+}
 
 impl SemaphoreMiddleware {
-    pub fn new(limit: usize) -> Self {
-        let semaphore = Semaphore::new(5);
-        let rate_limiter =
-            RateLimiter::direct(Quota::per_minute(NonZeroU32::new(limit as u32).unwrap()));
-        Self(Arc::new((semaphore, rate_limiter)))
+    pub fn new(pre_min_limit: u32, pre_sec_limit: u32, max_conn_limit: u32) -> Self {
+        let semaphore = Semaphore::new(max_conn_limit as usize);
+        let min_rate_limiter = RateLimiter::direct(Quota::per_minute(
+            NonZeroU32::new(pre_min_limit).unwrap(),
+        ));
+        let sec_rate_limiter = RateLimiter::direct(Quota::per_second(
+            NonZeroU32::new(pre_sec_limit).unwrap(),
+        ));
+        Self {
+            max_conn_semaphore: semaphore,
+            pre_sec_limiter: sec_rate_limiter,
+            pre_min_limiter: min_rate_limiter,
+        }
     }
 }
 
@@ -128,11 +192,10 @@ impl Middleware for SemaphoreMiddleware {
         extensions: &mut http::Extensions,
         next: Next<'_>,
     ) -> reqwest_middleware::Result<Response> {
-        let (semaphore, rate_limiter) = self.0.as_ref();
-        let _ = semaphore.acquire().await.unwrap();
-        rate_limiter
-            .until_ready_with_jitter(Jitter::up_to(Duration::from_millis(800)))
-            .await;
+        let _ = self.max_conn_semaphore.acquire().await.unwrap();
+        self.pre_sec_limiter.until_ready().await;
+        self.pre_min_limiter.until_ready_with_jitter(Jitter::up_to(Duration::from_millis(800))).await;
+        trace!("Fetching: {}", req.url());
         next.run(req, extensions).await
     }
 }
