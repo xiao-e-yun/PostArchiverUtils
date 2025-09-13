@@ -6,17 +6,14 @@ use governor::{
     state::{InMemoryState, NotKeyed},
 };
 use http::Method;
-use log::trace;
+use log::{error, trace};
 use reqwest::{Client, IntoUrl, Request, Response};
 use reqwest_middleware::{ClientWithMiddleware, Middleware, Next, RequestBuilder};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::de::DeserializeOwned;
+use tempfile::{NamedTempFile, TempPath};
 use std::{
-    fs::File,
-    io::{BufWriter, Write},
-    num::NonZeroU32,
-    ops::{Deref, DerefMut},
-    time::Duration,
+    io::{BufWriter, Write}, num::NonZeroU32, ops::{Deref, DerefMut}, time::Duration
 };
 use tokio::sync::Semaphore;
 
@@ -111,10 +108,9 @@ impl ArchiveClient {
         &self,
         method: Method,
         url: impl IntoUrl + Clone,
-        file: &mut File,
-    ) -> Result<()> {
-        async fn handle(request: RequestBuilder, file: &mut File) -> Result<()> {
-            file.set_len(0)?;
+    ) -> Result<TempPath> {
+        async fn handle(request: RequestBuilder, file: &mut NamedTempFile) -> Result<()> {
+            file.as_file_mut().set_len(0)?;
 
             let response = request.send().await?;
             let mut stream = response.bytes_stream();
@@ -128,19 +124,32 @@ impl ArchiveClient {
             Ok(())
         }
 
-        let mut err = Ok(());
-        for _ in 0..=self.retry {
+        let mut file = NamedTempFile::new()?;
+        for i in 0..=self.retry {
             let request = self.request(method.clone(), url.clone());
-            match handle(request, file).await {
-                Ok(_) => return Ok(()),
-                Err(e) => err = Err(e),
+            match handle(request, &mut file).await {
+                Ok(()) => {
+                    file.as_file_mut().sync_all()?;
+                    return Ok(file.into_temp_path());
+                },
+                Err(e) => {
+                    let url = url.clone().into_url()?;
+                    let max_retry = self.retry + 1;
+                    if i == self.retry {
+                        error!("Failed to download {url} after {max_retry} attempts: {e}");
+                        return Err(e);
+                    } else {
+                        let retry_count = i + 1;
+                        error!("Attempt {retry_count}/{max_retry} to download {url} failed: {e}. Retrying...");
+                    }
+                }
             }
         }
-        err
+        unreachable!();
     }
 
-    pub async fn download(&self, url: impl IntoUrl + Clone, file: &mut File) -> Result<()> {
-        self.download_with_method(Method::GET, url, file).await
+    pub async fn download(&self, url: impl IntoUrl + Clone) -> Result<TempPath> {
+        self.download_with_method(Method::GET, url).await
     }
 }
 
