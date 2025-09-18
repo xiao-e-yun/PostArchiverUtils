@@ -109,29 +109,28 @@ impl ArchiveClient {
         method: Method,
         url: impl IntoUrl + Clone,
     ) -> Result<TempPath> {
-        async fn handle(request: RequestBuilder, file: &mut NamedTempFile) -> Result<()> {
-            file.as_file_mut().set_len(0)?;
-
+        async fn handle(request: RequestBuilder) -> Result<NamedTempFile> {
             let response = request.send().await?;
             let mut stream = response.bytes_stream();
 
-            let mut buffer = BufWriter::new(file);
+            let mut file = NamedTempFile::new()?;
+
+            let mut buffer = BufWriter::new(&mut file);
             while let Some(bytes) = stream.next().await {
                 let bytes = bytes?;
                 buffer.write_all(&bytes)?;
             }
             buffer.flush()?;
-            Ok(())
+            drop(buffer);
+
+            file.as_file_mut().sync_all()?;
+            Ok(file)
         }
 
-        let mut file = NamedTempFile::new()?;
         for i in 0..=self.retry {
             let request = self.request(method.clone(), url.clone());
-            match handle(request, &mut file).await {
-                Ok(()) => {
-                    file.as_file_mut().sync_all()?;
-                    return Ok(file.into_temp_path());
-                },
+            match handle(request).await {
+                Ok(file) => return Ok(file.into_temp_path()),
                 Err(e) => {
                     let url = url.clone().into_url()?;
                     let max_retry = self.retry + 1;
