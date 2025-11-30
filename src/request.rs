@@ -11,10 +11,13 @@ use reqwest::{Client, IntoUrl, Request, Response};
 use reqwest_middleware::{ClientWithMiddleware, Middleware, Next, RequestBuilder};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::de::DeserializeOwned;
-use tempfile::{NamedTempFile, TempPath};
 use std::{
-    io::{BufWriter, Write}, num::NonZeroU32, ops::{Deref, DerefMut}, time::Duration
+    io::{BufWriter, Write},
+    num::NonZeroU32,
+    ops::{Deref, DerefMut},
+    time::Duration,
 };
+use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Semaphore;
 
 use crate::{Error, Result};
@@ -77,20 +80,20 @@ impl ArchiveClientBuilder {
 }
 
 #[derive(Debug, Clone)]
-pub struct ArchiveClient{
+pub struct ArchiveClient {
     inner: ClientWithMiddleware,
-    retry: u32
+    retry: u32,
 }
 
 impl ArchiveClient {
-    pub fn builder(client: Client, pre_min_limit:u32) -> ArchiveClientBuilder {
+    pub fn builder(client: Client, pre_min_limit: u32) -> ArchiveClientBuilder {
         ArchiveClientBuilder::new(client, pre_min_limit)
     }
 
-    pub async fn fetch_with_method<T: DeserializeOwned>(
+    async fn fetch_with_method_without_retry<T: DeserializeOwned>(
         &self,
         method: Method,
-        url: impl IntoUrl,
+        url: impl IntoUrl + Clone,
     ) -> Result<T> {
         let request = self.inner.request(method, url);
         let response = request.send().await?;
@@ -100,7 +103,36 @@ impl ArchiveClient {
         })
     }
 
-    pub async fn fetch<T: DeserializeOwned>(&self, url: impl IntoUrl) -> Result<T> {
+    pub async fn fetch_with_method<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: impl IntoUrl + Clone,
+    ) -> Result<T> {
+        for i in 0..=self.retry {
+            match self
+                .fetch_with_method_without_retry(method.clone(), url.clone())
+                .await
+            {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    let url = url.clone().into_url()?;
+                    let max_retry = self.retry + 1;
+                    if i == self.retry {
+                        error!("Failed to fetch {url} after {max_retry} attempts: {e}");
+                        return Err(e);
+                    } else {
+                        let retry_count = i + 1;
+                        error!(
+                            "Attempt {retry_count}/{max_retry} to fetch {url} failed: {e}. Retrying..."
+                        );
+                    }
+                }
+            }
+        }
+        unreachable!();
+    }
+
+    pub async fn fetch<T: DeserializeOwned>(&self, url: impl IntoUrl + Clone) -> Result<T> {
         self.fetch_with_method(Method::GET, url).await
     }
 
@@ -139,7 +171,9 @@ impl ArchiveClient {
                         return Err(e);
                     } else {
                         let retry_count = i + 1;
-                        error!("Attempt {retry_count}/{max_retry} to download {url} failed: {e}. Retrying...");
+                        error!(
+                            "Attempt {retry_count}/{max_retry} to download {url} failed: {e}. Retrying..."
+                        );
                     }
                 }
             }
@@ -178,12 +212,10 @@ pub struct SemaphoreMiddleware {
 impl SemaphoreMiddleware {
     pub fn new(pre_min_limit: u32, pre_sec_limit: u32, max_conn_limit: u32) -> Self {
         let semaphore = Semaphore::new(max_conn_limit as usize);
-        let min_rate_limiter = RateLimiter::direct(Quota::per_minute(
-            NonZeroU32::new(pre_min_limit).unwrap(),
-        ));
-        let sec_rate_limiter = RateLimiter::direct(Quota::per_second(
-            NonZeroU32::new(pre_sec_limit).unwrap(),
-        ));
+        let min_rate_limiter =
+            RateLimiter::direct(Quota::per_minute(NonZeroU32::new(pre_min_limit).unwrap()));
+        let sec_rate_limiter =
+            RateLimiter::direct(Quota::per_second(NonZeroU32::new(pre_sec_limit).unwrap()));
         Self {
             max_conn_semaphore: semaphore,
             pre_sec_limiter: sec_rate_limiter,
@@ -202,7 +234,9 @@ impl Middleware for SemaphoreMiddleware {
     ) -> reqwest_middleware::Result<Response> {
         let _ = self.max_conn_semaphore.acquire().await.unwrap();
         self.pre_sec_limiter.until_ready().await;
-        self.pre_min_limiter.until_ready_with_jitter(Jitter::up_to(Duration::from_millis(800))).await;
+        self.pre_min_limiter
+            .until_ready_with_jitter(Jitter::up_to(Duration::from_millis(800)))
+            .await;
         trace!("Fetching: {}", req.url());
         next.run(req, extensions).await
     }
