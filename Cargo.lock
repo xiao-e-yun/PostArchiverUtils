@@ -1059,15 +1059,16 @@ checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
 name = "post-archiver"
-version = "0.4.3"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04c46f78bba8fe635bf2f16f113ee6e86c3298fc9169d668ae911f36f1cbb303"
+checksum = "664b11174d3a0d2bf5541bd1a69bc2f09f0d257da7deeb53f409bafd180555bc"
 dependencies = [
  "chrono",
  "dashmap",
  "rusqlite",
  "serde",
  "serde_json",
+ "thiserror 2.0.12",
 ]
 
 [[package]]

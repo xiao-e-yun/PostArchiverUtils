@@ -9,6 +9,8 @@ pub enum Error {
     #[error("Unexpected response: {0}")]
     UnexpectedResponse(serde_json::Error, String),
     #[error(transparent)]
+    PostArchiver(#[from] post_archiver::error::Error),
+    #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     ReqwestMiddleware(#[from] reqwest_middleware::Error),
