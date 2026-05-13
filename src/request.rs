@@ -12,12 +12,8 @@ use reqwest_middleware::{ClientWithMiddleware, Middleware, Next, RequestBuilder}
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::de::DeserializeOwned;
 use std::{
-    io::{BufWriter, Write},
-    num::NonZeroU32,
-    ops::{Deref, DerefMut},
-    time::Duration,
+    fs::File, io::{BufWriter, Write}, num::NonZeroU32, ops::{Deref, DerefMut}, path::{Path, PathBuf}, time::Duration
 };
-use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Semaphore;
 
 use crate::{Error, Result};
@@ -136,16 +132,20 @@ impl ArchiveClient {
         self.fetch_with_method(Method::GET, url).await
     }
 
-    pub async fn download_with_method(
+    pub async fn download(
         &self,
-        method: Method,
+        with_in: &Path,
         url: impl IntoUrl + Clone,
-    ) -> Result<TempPath> {
-        async fn handle(request: RequestBuilder) -> Result<NamedTempFile> {
+    ) -> Result<PathBuf> {
+        async fn handle(with_in: &Path , request: RequestBuilder) -> Result<PathBuf> {
             let response = request.send().await?;
             let mut stream = response.bytes_stream();
 
-            let mut file = NamedTempFile::new()?;
+            let filename: String = (0..10)
+                .map(|_| fastrand::alphanumeric())
+                .collect();
+            let path = with_in.join(filename);
+            let mut file = File::create(&path)?;
 
             let mut buffer = BufWriter::new(&mut file);
             while let Some(bytes) = stream.next().await {
@@ -155,14 +155,14 @@ impl ArchiveClient {
             buffer.flush()?;
             drop(buffer);
 
-            file.as_file_mut().sync_all()?;
-            Ok(file)
+            file.sync_all()?;
+            Ok(path)
         }
 
         for i in 0..=self.retry {
-            let request = self.request(method.clone(), url.clone());
-            match handle(request).await {
-                Ok(file) => return Ok(file.into_temp_path()),
+            let request = self.request(Method::GET, url.clone());
+            match handle(&with_in, request).await {
+                Ok(file) => return Ok(file),
                 Err(e) => {
                     let url = url.clone().into_url()?;
                     let max_retry = self.retry + 1;
@@ -179,10 +179,6 @@ impl ArchiveClient {
             }
         }
         unreachable!();
-    }
-
-    pub async fn download(&self, url: impl IntoUrl + Clone) -> Result<TempPath> {
-        self.download_with_method(Method::GET, url).await
     }
 }
 
