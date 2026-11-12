@@ -1,239 +1,290 @@
 use futures::StreamExt;
 use governor::{
     Jitter, Quota, RateLimiter,
-    clock::{QuantaClock, QuantaInstant},
+    clock::QuantaClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
-use http::Method;
-use log::{error, trace};
-use reqwest::{Client, IntoUrl, Request, Response};
-use reqwest_middleware::{ClientWithMiddleware, Middleware, Next, RequestBuilder};
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use http::{HeaderMap, Method, StatusCode};
+use log::{error, trace, warn};
+use reqwest::{Client, IntoUrl, RequestBuilder, Response};
+use reqwest_retry::{RetryDecision, RetryPolicy, policies::ExponentialBackoff};
 use serde::de::DeserializeOwned;
 use std::{
-    fs::File, io::{BufWriter, Write}, num::NonZeroU32, ops::{Deref, DerefMut}, path::{Path, PathBuf}, time::Duration
+    num::NonZeroU32,
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
-use tokio::sync::Semaphore;
+use tokio::{
+    fs::File,
+    io::{AsyncWriteExt, BufWriter},
+    sync::Semaphore,
+    time::sleep,
+};
 
-use crate::{Error, Result};
-
-pub struct ArchiveClientBuilder {
-    client: Client,
-    pre_min_limit: u32,
-    pre_sec_limit: Option<u32>,
-    max_conn_limit: Option<u32>,
-    retry_limit: u32,
+#[derive(Debug, Clone)]
+pub struct Limit {
+    pub per_min: NonZeroU32,
+    pub burst: NonZeroU32,
+    pub concurrency: u32,
+    pub retries: u8,
 }
 
-impl ArchiveClientBuilder {
-    pub fn new(client: Client, pre_min_limit: u32) -> Self {
+impl Default for Limit {
+    fn default() -> Self {
         Self {
-            client,
-            pre_min_limit,
-            pre_sec_limit: None,
-            max_conn_limit: None,
-            retry_limit: 3,
+            per_min: NonZeroU32::new(60).unwrap(),
+            burst: NonZeroU32::new(4).unwrap(),
+            concurrency: 2,
+            retries: 3,
         }
     }
+}
 
-    pub fn pre_min_limit(mut self, limit: u32) -> Self {
-        self.pre_min_limit = limit;
-        self
+impl Limit {
+    fn semaphore(&self) -> Semaphore {
+        Semaphore::new(self.concurrency as usize)
     }
-
-    pub fn pre_sec_limit(mut self, limit: u32) -> Self {
-        self.pre_sec_limit = Some(limit);
-        self
-    }
-
-    pub fn max_conn_limit(mut self, limit: u32) -> Self {
-        self.max_conn_limit = Some(limit);
-        self
-    }
-
-    pub fn retry_limit(mut self, limit: u32) -> Self {
-        self.retry_limit = limit;
-        self
-    }
-
-    pub fn build(self) -> ArchiveClient {
-        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(self.retry_limit);
-        let client = reqwest_middleware::ClientBuilder::new(self.client)
-            .with(SemaphoreMiddleware::new(
-                self.pre_min_limit,
-                self.pre_sec_limit.or(self.max_conn_limit).unwrap_or(4),
-                self.max_conn_limit.or(self.pre_sec_limit).unwrap_or(4),
-            ))
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
-
-        ArchiveClient {
-            inner: client,
-            retry: self.retry_limit,
-        }
+    fn limiter(&self) -> RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware> {
+        let quota = Quota::per_minute(self.per_min).allow_burst(self.burst);
+        RateLimiter::direct(quota)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ArchiveClient {
-    inner: ClientWithMiddleware,
-    retry: u32,
+    pub client: Client,
+    limiters: Arc<(
+        Semaphore,
+        RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware>,
+    )>,
+    limits: Limit,
 }
 
 impl ArchiveClient {
-    pub fn builder(client: Client, pre_min_limit: u32) -> ArchiveClientBuilder {
-        ArchiveClientBuilder::new(client, pre_min_limit)
+    pub fn new(client: Client, limits: Limit) -> Self {
+        let limiters = Arc::new((limits.semaphore(), limits.limiter()));
+        Self {
+            client,
+            limits,
+            limiters,
+        }
     }
 
-    async fn fetch_with_method_without_retry<T: DeserializeOwned>(
+    pub async fn request<T>(
         &self,
-        method: Method,
-        url: impl IntoUrl + Clone,
+        request: &RequestBuilder,
+        callback: impl AsyncFn(Response) -> Result<T>,
     ) -> Result<T> {
-        let request = self.inner.request(method, url);
-        let response = request.send().await?;
-        let response = response.bytes().await?;
-        serde_json::from_slice(&response).map_err(|e| {
-            Error::UnexpectedResponse(e, String::from_utf8(response.to_vec()).unwrap())
-        })
-    }
+        let (semaphore, limiter) = self.limiters.deref();
 
-    pub async fn fetch_with_method<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        url: impl IntoUrl + Clone,
-    ) -> Result<T> {
-        for i in 0..=self.retry {
-            match self
-                .fetch_with_method_without_retry(method.clone(), url.clone())
-                .await
-            {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    let url = url.clone().into_url()?;
-                    let max_retry = self.retry + 1;
-                    if i == self.retry {
-                        error!("Failed to fetch {url} after {max_retry} attempts: {e}");
-                        return Err(e);
-                    } else {
-                        let retry_count = i + 1;
-                        error!(
-                            "Attempt {retry_count}/{max_retry} to fetch {url} failed: {e}. Retrying..."
-                        );
+        let policy =
+            ExponentialBackoff::builder().build_with_max_retries(self.limits.retries as u32);
+        let start = SystemTime::now();
+        for n in 0.. {
+            let permit = semaphore.acquire().await.unwrap();
+            limiter
+                .until_ready_with_jitter(Jitter::up_to(Duration::from_millis(200)))
+                .await;
+
+            let result = async {
+                let request = request.try_clone().unwrap();
+                let response = request.send().await?;
+
+                match response.status() {
+                    s if s.is_success() => {}
+                    StatusCode::TOO_MANY_REQUESTS => {
+                        return Err(RequestError::RateLimitExceeded);
                     }
+                    StatusCode::UNAUTHORIZED => {
+                        return Err(RequestError::InvalidSession);
+                    }
+                    s if s.is_server_error() || s == StatusCode::REQUEST_TIMEOUT => {
+                        return Err(RequestError::TemporaryError);
+                    }
+                    s => return Err(RequestError::UnexpectedStatus(s)),
+                }
+
+                callback(response).await
+            }
+            .await;
+
+            drop(permit);
+            match result {
+                Ok(result) => return Ok(result),
+                Err(e) if e.is_transient() => {
+                    warn!("{e}");
+                    match policy.should_retry(start, n) {
+                        RetryDecision::Retry { execute_after } => {
+                            sleep(
+                                execute_after
+                                    .duration_since(SystemTime::now())
+                                    .unwrap_or_default(),
+                            )
+                            .await
+                        }
+                        RetryDecision::DoNotRetry => {
+                            warn!("Exceeded retry limit after {} attempts: {e}", n + 1);
+                            return Err(e);
+                        }
+                    };
+                }
+                Err(e) => {
+                    error!("{e}");
+                    return Err(e);
                 }
             }
         }
-        unreachable!();
+        unreachable!()
     }
 
-    pub async fn fetch<T: DeserializeOwned>(&self, url: impl IntoUrl + Clone) -> Result<T> {
+    async fn fetch_with_method<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: impl IntoUrl,
+    ) -> Result<T> {
+        let url = url.into_url()?;
+        let req = self.client.request(method, url.clone());
+        let res = self
+            .request(&req, async |res| {
+                let bytes = res.bytes().await?;
+                serde_json::from_slice::<T>(&bytes).map_err(RequestError::UnexpectedResponse)
+            })
+            .await?;
+        trace!("Fetched {url}");
+        Ok(res)
+    }
+
+    pub async fn fetch<T: DeserializeOwned>(&self, url: impl IntoUrl) -> Result<T> {
         self.fetch_with_method(Method::GET, url).await
     }
 
-    pub async fn download(
-        &self,
-        with_in: &Path,
-        url: impl IntoUrl + Clone,
-    ) -> Result<PathBuf> {
-        async fn handle(with_in: &Path , request: RequestBuilder) -> Result<PathBuf> {
-            let response = request.send().await?;
-            let mut stream = response.bytes_stream();
+    pub async fn download(&self, with_in: &Path, url: impl IntoUrl) -> Result<PathBuf> {
+        let url = url.into_url()?;
+        let req = self.client.request(Method::GET, url.clone());
+        let path = self
+            .request(&req, async |res| {
+                let mut stream = res.bytes_stream();
 
-            let filename: String = (0..10)
-                .map(|_| fastrand::alphanumeric())
-                .collect();
-            let path = with_in.join(filename);
-            let mut file = File::create(&path)?;
+                let filename: String = (0..10).map(|_| fastrand::alphanumeric()).collect();
+                let path = with_in.join(filename);
+                let mut file = File::create(&path).await?;
 
-            let mut buffer = BufWriter::new(&mut file);
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                buffer.write_all(&bytes)?;
-            }
-            buffer.flush()?;
-            drop(buffer);
-
-            file.sync_all()?;
-            Ok(path)
-        }
-
-        for i in 0..=self.retry {
-            let request = self.request(Method::GET, url.clone());
-            match handle(&with_in, request).await {
-                Ok(file) => return Ok(file),
-                Err(e) => {
-                    let url = url.clone().into_url()?;
-                    let max_retry = self.retry + 1;
-                    if i == self.retry {
-                        error!("Failed to download {url} after {max_retry} attempts: {e}");
-                        return Err(e);
-                    } else {
-                        let retry_count = i + 1;
-                        error!(
-                            "Attempt {retry_count}/{max_retry} to download {url} failed: {e}. Retrying..."
-                        );
-                    }
+                let mut buffer = BufWriter::new(&mut file);
+                while let Some(bytes) = stream.next().await {
+                    let bytes = bytes?;
+                    buffer.write_all(&bytes).await?;
                 }
+                buffer.flush().await?;
+                drop(buffer);
+
+                file.sync_all().await?;
+                Ok(path)
+            })
+            .await?;
+        trace!("Downloaded {url}");
+        Ok(path)
+    }
+}
+
+pub fn browser_headers(user_agent: &str) -> reqwest::header::HeaderMap {
+    let platform = match user_agent {
+        ua if ua.contains("Windows") || ua.contains("Win64") => "\"Windows\"",
+        ua if ua.contains("Macintosh") || ua.contains("Mac OS X") => "\"macOS\"",
+        ua if ua.contains("Linux") || ua.contains("X11") => "\"Linux\"",
+        _ => "\"Unknown\"",
+    };
+
+    let mobile = match user_agent.contains("Mobile") {
+        true => "?1",
+        false => "?0",
+    };
+
+    let ua = match user_agent {
+        ua if ua.contains("Edg/") => "Edg",
+        ua if ua.contains("Chrome/") => "Chrome",
+        ua if ua.contains("Firefox/") => "Firefox",
+        ua if ua.contains("Safari/") && !ua.contains("Chrome/") => "Safari",
+        _ => "Unknown",
+    };
+
+    let version = match user_agent
+        .split_whitespace()
+        .find(|part| part.starts_with(ua))
+    {
+        Some(part) => match part.split('/').nth(1) {
+            Some(v) => v.split('.').next().unwrap_or("12"),
+            None => "12",
+        },
+        None => "12",
+    };
+
+    let ua = format!("\"Chromium\";v=\"{version}\",")
+        + &match ua {
+            "Edg" => format!("\"Microsoft Edge\";v=\"{version}\""),
+            "Chrome" => format!("\"Google Chrome\";v=\"{version}\""),
+            "Firefox" => format!("\"Firefox\";v=\"{version}\""),
+            "Safari" => format!("\"Safari\";v=\"{version}\""),
+            _ => format!("\"{ua}\";v=\"{version}\""),
+        }
+        + ", \"Not_A Brand\";v=\"99\"";
+
+    use http::header;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::USER_AGENT, user_agent.parse().unwrap());
+    headers.insert(header::DNT, "1".parse().unwrap());
+    headers.insert(header::ACCEPT_LANGUAGE, "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7".parse().unwrap());
+    headers.insert(header::ACCEPT, "application/json, text/plain, */*".parse().unwrap());
+
+    // sec-fetch headers
+    headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+    headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+    headers.insert("sec-fetch-site", "same-site".parse().unwrap());
+
+    if matches!(user_agent, ua if ua.contains("Edg/") || ua.contains("Chrome/")) {
+        headers.insert("sec-ch-ua", ua.parse().unwrap());
+        headers.insert("sec-ch-ua-platform", platform.parse().unwrap());
+        headers.insert("sec-ch-ua-mobile", mobile.parse().unwrap());
+    };
+
+    headers
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RequestError {
+    #[error("Rate limit exceeded")]
+    RateLimitExceeded,
+    #[error("Temporary error")]
+    TemporaryError,
+    #[error("Invalid session/token")]
+    InvalidSession,
+    #[error("Invalid response: {0}")]
+    InvalidResponse(String),
+    #[error("Unexpected response: {0}")]
+    UnexpectedResponse(serde_json::Error),
+    #[error("Unexpected status: {0}")]
+    UnexpectedStatus(StatusCode),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl RequestError {
+    fn is_transient(&self) -> bool {
+        match self {
+            RequestError::RateLimitExceeded
+            | RequestError::TemporaryError
+            | RequestError::InvalidResponse(_)
+            | RequestError::UnexpectedResponse(_) => true,
+            RequestError::Reqwest(e) => {
+                e.is_timeout() || e.is_connect() || e.is_body() || e.is_request()
             }
-        }
-        unreachable!();
-    }
-}
-
-impl Deref for ArchiveClient {
-    type Target = ClientWithMiddleware;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for ArchiveClient {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-type ArchiveRateLimiter =
-    RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware<QuantaInstant>>;
-#[derive(Debug)]
-pub struct SemaphoreMiddleware {
-    max_conn_semaphore: Semaphore,
-    pre_sec_limiter: ArchiveRateLimiter,
-    pre_min_limiter: ArchiveRateLimiter,
-}
-
-impl SemaphoreMiddleware {
-    pub fn new(pre_min_limit: u32, pre_sec_limit: u32, max_conn_limit: u32) -> Self {
-        let semaphore = Semaphore::new(max_conn_limit as usize);
-        let min_rate_limiter =
-            RateLimiter::direct(Quota::per_minute(NonZeroU32::new(pre_min_limit).unwrap()));
-        let sec_rate_limiter =
-            RateLimiter::direct(Quota::per_second(NonZeroU32::new(pre_sec_limit).unwrap()));
-        Self {
-            max_conn_semaphore: semaphore,
-            pre_sec_limiter: sec_rate_limiter,
-            pre_min_limiter: min_rate_limiter,
+            _ => false,
         }
     }
 }
 
-#[async_trait::async_trait]
-impl Middleware for SemaphoreMiddleware {
-    async fn handle(
-        &self,
-        req: Request,
-        extensions: &mut http::Extensions,
-        next: Next<'_>,
-    ) -> reqwest_middleware::Result<Response> {
-        let _ = self.max_conn_semaphore.acquire().await.unwrap();
-        self.pre_sec_limiter.until_ready().await;
-        self.pre_min_limiter
-            .until_ready_with_jitter(Jitter::up_to(Duration::from_millis(800)))
-            .await;
-        trace!("Fetching: {}", req.url());
-        next.run(req, extensions).await
-    }
-}
+type Result<T> = std::result::Result<T, RequestError>;
