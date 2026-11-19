@@ -107,7 +107,11 @@ impl ArchiveClient {
                     s if s.is_server_error() || s == StatusCode::REQUEST_TIMEOUT => {
                         return Err(RequestError::TemporaryError);
                     }
-                    s => return Err(RequestError::UnexpectedStatus(s)),
+                    s => {
+                        // Keep the body: APIs often explain the failure there (e.g. a JSON `error` field).
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(RequestError::UnexpectedStatus(s, body));
+                    }
                 }
 
                 callback(response).await
@@ -267,8 +271,9 @@ pub enum RequestError {
     InvalidResponse(String),
     #[error("Unexpected response: {0}")]
     UnexpectedResponse(serde_json::Error),
+    /// Non-success status not covered above, with the response body.
     #[error("Unexpected status: {0}")]
-    UnexpectedStatus(StatusCode),
+    UnexpectedStatus(StatusCode, String),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
