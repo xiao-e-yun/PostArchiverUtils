@@ -8,6 +8,7 @@ authors = ["xiao-e-yun <me@xiaoeyun.me>"]
 repository = "https://github.com/xiao-e-yun/PostArchiverUtils"
 
 [dependencies]
+clap = { version = "4.5", default-features = false, features = ["std", "derive"] }
 console = "0.16"
 log = "0.4"
 post-archiver = { version = "0.6", features = ["importer"] }

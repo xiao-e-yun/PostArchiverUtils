@@ -1,10 +1,14 @@
 use std::{fmt, str::FromStr};
 
 /// Represents the strategy for importing data into the archive.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// Implements [`clap::ValueEnum`], so `--help` lists the values with their descriptions.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum Strategy {
+    /// Only fetch posts newer than the last run, and skip posts already in the archive
     #[default]
     Increment,
+    /// Fetch everything again and re-import posts already in the archive
     Full,
 }
 
