@@ -108,8 +108,8 @@ impl ArchiveClient {
                         return Err(RequestError::TemporaryError);
                     }
                     s => {
-                        // Keep the body: APIs often explain the failure there (e.g. a JSON `error` field).
-                        let body = response.text().await.unwrap_or_default();
+                        const FALLBACK: &str = "Response body unavailable";
+                        let body = response.text().await.unwrap_or(FALLBACK.to_string());
                         return Err(RequestError::UnexpectedStatus(s, body));
                     }
                 }
