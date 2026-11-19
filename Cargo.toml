@@ -10,7 +10,7 @@ repository = "https://github.com/xiao-e-yun/PostArchiverUtils"
 [dependencies]
 console = "0.16"
 log = "0.4"
-post-archiver = { path = "../post-archiver", features = ["importer"] }
+post-archiver = { version = "0.6", features = ["importer"] }
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls-alpn"] }
 reqwest-retry = "0.7"
 futures = "0.3"

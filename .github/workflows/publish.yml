@@ -33,4 +33,4 @@ jobs:
         run: |-
           cargo publish \
             --allow-dirty \
-            --no-verify \
+            --no-verify
