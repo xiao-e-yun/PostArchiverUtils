@@ -73,11 +73,14 @@ impl ArchiveClient {
         }
     }
 
-    pub async fn request<T>(
+    pub async fn request<T, Fut>(
         &self,
         request: &RequestBuilder,
-        callback: impl AsyncFn(Response) -> Result<T>,
-    ) -> Result<T> {
+        callback: impl Fn(Response) -> Fut,
+    ) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
         let (semaphore, limiter) = self.limiters.deref();
 
         let policy =
@@ -148,7 +151,7 @@ impl ArchiveClient {
         let url = url.into_url()?;
         let req = self.client.request(method, url.clone());
         let res = self
-            .request(&req, async |res| {
+            .request(&req, |res| async move {
                 let bytes = res.bytes().await?;
                 serde_json::from_slice::<T>(&bytes).map_err(RequestError::UnexpectedResponse)
             })
@@ -165,7 +168,7 @@ impl ArchiveClient {
         let url = url.into_url()?;
         let req = self.client.request(Method::GET, url.clone());
         let path = self
-            .request(&req, async |res| {
+            .request(&req, |res| async move {
                 let mut stream = res.bytes_stream();
 
                 let filename: String = (0..10).map(|_| fastrand::alphanumeric()).collect();

@@ -8,6 +8,16 @@ pub enum Error {
     Request(#[from] RequestError),
     #[error(transparent)]
     PostArchiver(#[from] post_archiver::error::Error),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::PostArchiver(post_archiver::error::Error::Io(err))
+    }
+}
+
+impl From<post_archiver::utils::rusqlite::Error> for Error {
+    fn from(err: post_archiver::utils::rusqlite::Error) -> Self {
+        Error::PostArchiver(post_archiver::error::Error::Rusqlite(err))
+    }
 }

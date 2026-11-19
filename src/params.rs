@@ -21,6 +21,9 @@ impl FromStr for Strategy {
 
 impl fmt::Display for Strategy {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self { Self::Increment => "increment", Self::Full => "full" })
+        f.write_str(match self {
+            Self::Increment => "increment",
+            Self::Full => "full",
+        })
     }
 }
