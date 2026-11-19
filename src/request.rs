@@ -288,7 +288,10 @@ impl RequestError {
             | RequestError::InvalidResponse(_)
             | RequestError::UnexpectedResponse(_) => true,
             RequestError::Reqwest(e) => {
-                e.is_timeout() || e.is_connect() || e.is_body() || e.is_request()
+                // A connection dropped while streaming a body is reported as a decode error
+                // (`bytes_stream` maps body errors to `Kind::Decode`), so retry those too.
+                // JSON is parsed with serde_json (`UnexpectedResponse`), not reqwest.
+                e.is_timeout() || e.is_connect() || e.is_body() || e.is_request() || e.is_decode()
             }
             _ => false,
         }
@@ -296,3 +299,55 @@ impl RequestError {
 }
 
 type Result<T> = std::result::Result<T, RequestError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// A body that breaks off mid-download surfaces as a reqwest *decode* error
+    /// (`bytes_stream` maps body errors to `Kind::Decode`); it must be retried.
+    #[tokio::test]
+    async fn download_retries_when_connection_drops_mid_body() {
+        const BODY: &[u8] = b"0123456789";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let served = attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let attempt = served.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    BODY.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                if attempt == 0 {
+                    // Send part of the body, then drop the connection.
+                    socket.write_all(&BODY[..3]).await.unwrap();
+                } else {
+                    socket.write_all(BODY).await.unwrap();
+                }
+                socket.shutdown().await.ok();
+            }
+        });
+
+        let client = ArchiveClient::new(Client::new(), Limit::default());
+        let dir = tempfile::tempdir().unwrap();
+        let path = client
+            .download(dir.path(), format!("http://{addr}/file"))
+            .await
+            .expect("download should succeed after retrying");
+
+        assert_eq!(std::fs::read(path).unwrap(), BODY);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+}
